@@ -1,0 +1,526 @@
+
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Z-Buffer Visualisierung</title>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Arial, sans-serif;
+      background: #eee;
+      color: #222;
+    }
+
+    main {
+      max-width: 900px;
+      margin: auto;
+    }
+
+    h1, h2 {
+      margin-bottom: 10px;
+    }
+
+    p {
+      line-height: 1.5;
+    }
+
+    canvas {
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      display: block;
+      background: white;
+      border: 1px solid #aaa;
+    }
+
+    .bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 12px 0;
+      flex-wrap: wrap;
+    }
+
+    .ramp {
+      width: 200px;
+      height: 14px;
+      background: linear-gradient(to right, black, white);
+      border: 1px solid #aaa;
+    }
+
+    table {
+      border-collapse: collapse;
+      background: white;
+    }
+
+    th, td {
+      padding: 6px 12px;
+      border: 1px solid #ccc;
+      text-align: left;
+    }
+
+    a {
+      color: #245da5;
+    }
+
+    #err {
+      color: red;
+    }
+  </style>
+</head>
+
+<body>
+<main>
+
+  <h1>Z-Buffer Visualisierung</h1>
+  <p>Tiefe und Verdeckungen von Objekten – dunkle Bereiche liegen näher an der Kamera, helle weiter entfernt.</p>
+
+  <canvas id="gl"></canvas>
+  <p id="err"></p>
+
+  <div class="bar">
+    <span>nah</span>
+    <div class="ramp"></div>
+    <span>fern</span>
+    <label>
+      <input type="checkbox" id="raw">
+      Rohen Z-Wert anzeigen
+    </label>
+  </div>
+
+  <h2>Bedienung</h2>
+  <p>Die Tasten können verwendet werden, sobald die Webseite aktiv ist.</p>
+
+  <table>
+    <tr><th>Taste</th><th>Aktion</th></tr>
+    <tr><td>W / S</td><td>Kamera nach oben / unten bewegen</td></tr>
+    <tr><td>A / D</td><td>Kamera nach links / rechts bewegen</td></tr>
+    <tr><td>← / →</td><td>Szene um die Y-Achse drehen</td></tr>
+    <tr><td>↑ / ↓</td><td>Szene um die X-Achse drehen</td></tr>
+  </table>
+
+  <h2>Szene</h2>
+  <p>
+    Die Szene besteht aus einem Würfel, einer Kugel und einem Zylinder,
+    die sich in der Mitte überschneiden. Weitere Würfel bilden einen
+    Korridor in die Tiefe. Ein Boden und zusätzliche Körper sorgen
+    für weitere Tiefenunterschiede.
+  </p>
+
+  <h2>Umsetzung</h2>
+  <p>
+    Der Fragment-Shader liest den Z-Wert eines Fragments über
+    <code>gl_FragCoord.z</code>. Dieser Wert ist bei perspektivischer
+    Projektion nicht linear verteilt. Deshalb wird er zunächst in die
+    lineare Tiefe umgerechnet und anschließend zwischen Near- und
+    Far-Plane normalisiert. Die Tiefe wird als Graustufe dargestellt:
+    0 entspricht Schwarz und 1 entspricht Weiß.
+  </p>
+  <p>
+    Über die Checkbox kann alternativ der rohe, nichtlineare Z-Wert
+    angezeigt werden. Dabei wird deutlich, dass sich die Tiefenwerte
+    nahe der Kamera stärker unterscheiden.
+  </p>
+
+  <h2>Quellen</h2>
+  <ul>
+    <li><a href="https://developer.nvidia.com/blog/visualizing-depth-precision/" target="_blank">NVIDIA: Visualizing Depth Precision</a></li>
+    <li><a href="https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API" target="_blank">MDN: WebGL API</a></li>
+    <li><a href="https://learnopengl.com/Advanced-OpenGL/Depth-testing" target="_blank">LearnOpenGL: Depth Testing</a></li>
+    <li>Kursmaterial: Kapitel KUF und SHA</li>
+  </ul>
+
+  <h2>Test und Anmerkungen</h2>
+  <p>
+    Getestet in Chrome unter macOS. Die Shader-Kompilierung und
+    Programmverknüpfung werden auf Fehler geprüft und entsprechende
+    Meldungen ausgegeben. Die Anwendung benötigt keine externen Bibliotheken.
+  </p>
+
+</main>
+
+<script>
+  "use strict";
+
+  const canvas = document.getElementById("gl");
+  const err = document.getElementById("err");
+  const rawBox = document.getElementById("raw");
+  const gl = canvas.getContext("webgl");
+
+  if (!gl) {
+    err.textContent = "WebGL wird von diesem Browser nicht unterstützt.";
+    throw new Error("WebGL nicht verfügbar");
+  }
+
+  const NEAR = 1;
+  const FAR = 45;
+
+  // Shader
+  const VS = `
+attribute vec3 aPos;
+uniform mat4 uMVP;
+
+void main() {
+  gl_Position = uMVP * vec4(aPos, 1.0);
+}`;
+
+  const FS = `
+precision highp float;
+
+uniform float uNear;
+uniform float uFar;
+uniform bool uRaw;
+
+void main() {
+  float z = gl_FragCoord.z;
+  float ndc = z * 2.0 - 1.0;
+
+  float zEye = (2.0 * uNear * uFar) /
+    (uFar + uNear - ndc * (uFar - uNear));
+
+  float depth = (zEye - uNear) / (uFar - uNear);
+  float gray = uRaw ? z : depth;
+
+  gl_FragColor = vec4(vec3(clamp(gray, 0.0, 1.0)), 1.0);
+}`;
+
+  // Shader kompilieren
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader));
+    }
+
+    return shader;
+  }
+
+  // Shader-Programm erstellen
+  let program;
+
+  try {
+    program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, VS));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program));
+    }
+  } catch (e) {
+    err.textContent = "Shader-Fehler: " + e.message;
+    console.error(e);
+    throw e;
+  }
+
+  gl.useProgram(program);
+
+  const posLoc = gl.getAttribLocation(program, "aPos");
+  const mvpLoc = gl.getUniformLocation(program, "uMVP");
+  const nearLoc = gl.getUniformLocation(program, "uNear");
+  const farLoc = gl.getUniformLocation(program, "uFar");
+  const rawLoc = gl.getUniformLocation(program, "uRaw");
+
+  gl.uniform1f(nearLoc, NEAR);
+  gl.uniform1f(farLoc, FAR);
+
+  // Matrizen
+  function identity() {
+    return new Float32Array([
+      1,0,0,0,
+      0,1,0,0,
+      0,0,1,0,
+      0,0,0,1
+    ]);
+  }
+
+  function multiply(a, b) {
+    const r = new Float32Array(16);
+
+    for (let c = 0; c < 4; c++) {
+      for (let row = 0; row < 4; row++) {
+        for (let k = 0; k < 4; k++) {
+          r[c*4+row] += a[k*4+row] * b[c*4+k];
+        }
+      }
+    }
+    return r;
+  }
+
+  function translate(x, y, z) {
+    const m = identity();
+    m[12] = x;
+    m[13] = y;
+    m[14] = z;
+    return m;
+  }
+
+  function scale(x, y, z) {
+    const m = identity();
+    m[0] = x;
+    m[5] = y;
+    m[10] = z;
+    return m;
+  }
+
+  function rotateX(a) {
+    const m = identity();
+    const c = Math.cos(a), s = Math.sin(a);
+    m[5] = c; m[6] = s;
+    m[9] = -s; m[10] = c;
+    return m;
+  }
+
+  function rotateY(a) {
+    const m = identity();
+    const c = Math.cos(a), s = Math.sin(a);
+    m[0] = c; m[2] = -s;
+    m[8] = s; m[10] = c;
+    return m;
+  }
+
+  function perspective(fovy, aspect, n, f) {
+    const t = 1 / Math.tan(fovy / 2);
+    const m = new Float32Array(16);
+
+    m[0] = t / aspect;
+    m[5] = t;
+    m[10] = (f + n) / (n - f);
+    m[11] = -1;
+    m[14] = 2 * f * n / (n - f);
+
+    return m;
+  }
+
+  // Geometrie
+  function makeMesh(vertices, indices) {
+    const vb = gl.createBuffer();
+    const ib = gl.createBuffer();
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+
+    return { vb, ib, count: indices.length };
+  }
+
+  function cube() {
+    const p = [], i = [];
+
+    for (let k = 0; k < 8; k++) {
+      p.push(
+              k & 1 ? 0.5 : -0.5,
+              k & 2 ? 0.5 : -0.5,
+              k & 4 ? 0.5 : -0.5
+      );
+    }
+
+    const faces = [
+      [0,1,3,2], [4,6,7,5],
+      [0,2,6,4], [1,5,7,3],
+      [0,4,5,1], [2,3,7,6]
+    ];
+
+    for (const q of faces) {
+      i.push(q[0],q[1],q[2], q[0],q[2],q[3]);
+    }
+
+    return makeMesh(p, i);
+  }
+
+  function sphere(lat = 24, lon = 32) {
+    const p = [], i = [];
+
+    for (let a = 0; a <= lat; a++) {
+      const t = a * Math.PI / lat;
+
+      for (let b = 0; b <= lon; b++) {
+        const f = b * 2 * Math.PI / lon;
+
+        p.push(
+                0.5 * Math.sin(t) * Math.cos(f),
+                0.5 * Math.cos(t),
+                0.5 * Math.sin(t) * Math.sin(f)
+        );
+      }
+    }
+
+    for (let a = 0; a < lat; a++) {
+      for (let b = 0; b < lon; b++) {
+        const x = a * (lon + 1) + b;
+        const y = x + lon + 1;
+
+        i.push(x,y,x+1, y,y+1,x+1);
+      }
+    }
+
+    return makeMesh(p, i);
+  }
+
+  function cylinder(seg = 32, topR = 0.5) {
+    const p = [], i = [];
+
+    for (let s = 0; s < seg; s++) {
+      const f = s * 2 * Math.PI / seg;
+      const x = Math.cos(f), z = Math.sin(f);
+
+      p.push(0.5*x, -0.5, 0.5*z);
+      p.push(topR*x, 0.5, topR*z);
+    }
+
+    for (let s = 0; s < seg; s++) {
+      const a = s * 2;
+      const b = ((s + 1) % seg) * 2;
+
+      i.push(a,b,a+1, b,b+1,a+1);
+    }
+
+    const bottom = p.length / 3;
+    p.push(0,-0.5,0, 0,0.5,0);
+
+    for (let s = 0; s < seg; s++) {
+      const a = s * 2;
+      const b = ((s + 1) % seg) * 2;
+
+      i.push(bottom,b,a, bottom+1,a+1,b+1);
+    }
+
+    return makeMesh(p, i);
+  }
+
+  const meshes = {
+    cube: cube(),
+    sphere: sphere(),
+    cylinder: cylinder(),
+    cone: cylinder(32, 0.02)
+  };
+
+  // Szene
+  const objects = [
+    [meshes.cube, [0,0,0], [4,4,4]],
+    [meshes.sphere, [1.6,0.8,1.2], [5,5,5]],
+    [meshes.cylinder, [-1.2,0,-0.5], [2.2,7,2.2]],
+    [meshes.cube, [0,-2.6,-4], [14,0.4,30]],
+    [meshes.cone, [-3.5,-0.3,6], [2.5,4.5,2.5]],
+    [meshes.sphere, [4.5,0.5,4], [2.5,2.5,2.5]]
+  ];
+
+  // Würfel-Korridor
+  for (let k = 0; k < 8; k++) {
+    const z = -5 - k * 3.2;
+    const s = 1.4 + (k % 2) * 0.8;
+
+    objects.push([meshes.cube, [-3.6,-1.4+s/2,z], [s,s,s]]);
+    objects.push([meshes.cube, [3.6,-1.4+s/2,z-1.5], [s,s,s]]);
+
+    if (k % 3 === 0) {
+      objects.push([meshes.cylinder, [0,-0.6,z-0.8], [1.2,3,1.2]]);
+    }
+  }
+
+  // Tastatursteuerung
+  const keys = new Set();
+  const handled = [
+    "KeyW", "KeyA", "KeyS", "KeyD",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"
+  ];
+
+  window.addEventListener("keydown", e => {
+    if (handled.includes(e.code)) {
+      keys.add(e.code);
+      e.preventDefault();
+    }
+  });
+
+  window.addEventListener("keyup", e => keys.delete(e.code));
+  window.addEventListener("blur", () => keys.clear());
+
+  // Kamera
+  const camera = { x: 0, y: 1.5, z: 14 };
+  let yaw = 0.5;
+  let pitch = 0.25;
+
+  // Rendering
+  gl.enable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.clearColor(1, 1, 1, 1);
+
+  function resize() {
+    const w = Math.round(canvas.clientWidth * devicePixelRatio);
+    const h = Math.round(canvas.clientHeight * devicePixelRatio);
+
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+
+  let last = performance.now();
+
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+
+    const move = 8 * dt;
+    const turn = 1.6 * dt;
+
+    if (keys.has("KeyA")) camera.x -= move;
+    if (keys.has("KeyD")) camera.x += move;
+    if (keys.has("KeyW")) camera.y += move;
+    if (keys.has("KeyS")) camera.y -= move;
+
+    if (keys.has("ArrowLeft")) yaw -= turn;
+    if (keys.has("ArrowRight")) yaw += turn;
+    if (keys.has("ArrowUp")) pitch -= turn;
+    if (keys.has("ArrowDown")) pitch += turn;
+
+    resize();
+
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.uniform1i(rawLoc, rawBox.checked ? 1 : 0);
+
+    const projection = perspective(
+            Math.PI / 3,
+            canvas.width / canvas.height,
+            NEAR,
+            FAR
+    );
+
+    const view = translate(-camera.x, -camera.y, -camera.z);
+    const rotation = multiply(rotateX(pitch), rotateY(yaw));
+    const vp = multiply(projection, multiply(view, rotation));
+
+    gl.enableVertexAttribArray(posLoc);
+
+    for (const [mesh, position, size] of objects) {
+      const model = multiply(
+              translate(...position),
+              scale(...size)
+      );
+
+      gl.uniformMatrix4fv(mvpLoc, false, multiply(vp, model));
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vb);
+      gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ib);
+      gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_SHORT, 0);
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+</script>
+
+</body>
+</html>
